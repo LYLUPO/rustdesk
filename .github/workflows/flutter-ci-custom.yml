@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version (e.g. 1.4.1)"
+        description: "Version (e.g. 1.4.9)"
         required: false
         default: "1.4.9"
   push:
@@ -24,17 +24,11 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # ============================================================
-      # 1. 拉取代码（含子模块）
-      # ============================================================
       - name: Checkout rustdesk
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # ============================================================
-      # 2. Flutter 环境
-      # ============================================================
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -44,18 +38,11 @@ jobs:
       - name: Enable Flutter desktop
         run: flutter config --enable-windows-desktop
 
-      # ============================================================
-      # 3. Rust 环境
-      # ============================================================
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      # ============================================================
-      # 4. vcpkg（仅 clone + bootstrap，不手动 install）
-      #    RustDesk 有 vcpkg.json → 清单模式 → cargo build 时自动安装依赖
-      # ============================================================
       - name: Setup vcpkg
         shell: pwsh
         run: |
@@ -65,15 +52,12 @@ jobs:
           .\bootstrap-vcpkg.bat
           echo "VCPKG_ROOT=$PWD" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Install vcpkg dependencies
+      - name: Install vcpkg dependencies (manifest mode)
         shell: pwsh
         run: |
           $vcpkg = "$env:VCPKG_ROOT\vcpkg.exe"
           & $vcpkg install --triplet x64-windows
 
-      # ============================================================
-      # 5. LLVM（ffigen 需要 liclang）
-      # ============================================================
       - name: Install LLVM (for ffigen)
         run: choco install llvm --version=16.0.6 -y
 
@@ -82,29 +66,19 @@ jobs:
         run: |
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      # ============================================================
-      # 6. 写死服务器配置到 hbb_common
-      # ============================================================
       - name: Patch hbb_common with company server
         shell: pwsh
         run: |
           $file = "libs/hbb_common/src/config.rs"
-
-          $content = Get-Content $file
-          $content = $content -replace `
+          (Get-Content $file) -replace `
             'pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[.*\];', `
-            'pub const RENDEZVOUS_SERVERS: &[&str] = &["${{ env.RENDEZVOUS_SERVER }}"];'
-          $content = $content -replace `
+            'pub const RENDEZVOUS_SERVERS: &[&str] = &["${{ env.RENDEZVOUS_SERVER }}"];' |
+            Set-Content $file
+          (Get-Content $file) -replace `
             'pub const RS_PUB_KEY: &str = ".*";', `
-            'pub const RS_PUB_KEY: &str = "${{ env.RS_PUB_KEY }}";'
-          $content | Set-Content $file
+            'pub const RS_PUB_KEY: &str = "${{ env.RS_PUB_KEY }}";' |
+            Set-Content $file
 
-          Write-Host "=== Verify patch ==="
-          Select-String -Path $file -Pattern "RENDEZVOUS_SERVERS|RS_PUB_KEY"
-
-      # ============================================================
-      # 7. 编译 Flutter Windows 客户端
-      # ============================================================
       - name: Build Flutter Windows
         shell: pwsh
         working-directory: flutter
@@ -112,96 +86,57 @@ jobs:
           flutter pub get
           flutter build windows --release
 
-      # ============================================================
-      # 8. 拷贝产物到官方 NSIS 脚本期望的路径
-      # ============================================================
       - name: Prepare files for NSIS
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path target/release | Out-Null
-          Copy-Item flutter/build/windows/x64/runner/Release/* target/release/ -Recurse -Force
-          Write-Host "=== target/release contents ==="
-          Get-ChildItem target/release | Select-Object Name, Length
+          New-Item -ItemType Directory -Force -Path target/release
+          Copy-Item flutter/build/windows/x64/runner/Release/* target/release/ -Recurse
 
-      # ============================================================
-      # 9. 打包 Portable ZIP
-      # ============================================================
       - name: Prepare portable package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item flutter/build/windows/x64/runner/Release/* dist/ -Recurse -Force
-          Compress-Archive -Path dist/* -DestinationPath rustdesk-portable-windows-x64.zip -Force
-          Write-Host "=== Portable ZIP created ==="
-          Get-Item rustdesk-portable-windows-x64.zip | Select-Object Name, Length
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item flutter/build/windows/x64/runner/Release/* dist/ -Recurse
+          Compress-Archive -Path dist/* -DestinationPath rustdesk-portable-windows-x64.zip
 
-      # ============================================================
-      # 10. 安装 NSIS
-      # ============================================================
       - name: Install NSIS
         run: choco install nsis -y
 
-      # ============================================================
-      # 11. 编译 NSIS 安装包
-      # ============================================================
       - name: Build NSIS Installer
         shell: pwsh
         run: |
           makensis res/setup.nsi
-          Write-Host "=== Installer created ==="
-          Get-Item rustdesk-setup.exe | Select-Object Name, Length
 
-      # ============================================================
-      # 12. 提取版本号
-      # ============================================================
       - name: Get version
         id: get_version
         shell: pwsh
         run: |
           $ver = "${{ github.event.inputs.version }}"
           if (-not $ver) {
-            $match = Select-String -Path res/setup.nsi -Pattern '!define VERSION "(.*)"'
-            if ($match) { $ver = $match.Matches.Groups[1].Value }
+            $ver = (Select-String -Path res/setup.nsi -Pattern '!define VERSION "(.*)"').Matches.Groups[1].Value
           }
-          if (-not $ver) { $ver = "1.4.1" }
+          if (-not $ver) { $ver = "1.4.9" }
           echo "VERSION=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Build version: $ver"
 
-      # ============================================================
-      # 13. 重命名安装包
-      # ============================================================
       - name: Rename installer
         shell: pwsh
         run: |
-          $installer = "rustdesk-${{ steps.get_version.outputs.VERSION }}-company-setup.exe"
-          Move-Item rustdesk-setup.exe $installer -Force
-          Write-Host "Renamed to: $installer"
+          Move-Item rustdesk-setup.exe rustdesk-${{ steps.get_version.outputs.VERSION }}-company-setup.exe
 
-      # ============================================================
-      # 14. 生成构建信息文件
-      # ============================================================
       - name: Generate build info
         shell: pwsh
         run: |
-          $info = @"
-          ========================================
+          @"
           RustDesk Custom Build
-          ========================================
-          Version:        ${{ steps.get_version.outputs.VERSION }}
-          ID Server:      ${{ env.RENDEZVOUS_SERVER }}
-          Relay Server:   ${{ env.RENDEZVOUS_SERVER }}
-          API Server:     ${{ env.API_SERVER }}
-          Build Time:     $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-          Commit:         ${{ github.sha }}
-          Branch:         ${{ github.ref_name }}
-          ========================================
-          "@
-          $info | Out-File -Encoding UTF8 BUILD_INFO.txt
-          Write-Host $info
+          ====================
+          Version: ${{ steps.get_version.outputs.VERSION }}
+          ID Server: ${{ env.RENDEZVOUS_SERVER }}
+          Relay Server: ${{ env.RENDEZVOUS_SERVER }}
+          API Server: ${{ env.API_SERVER }}
+          Build Time: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          Commit: ${{ github.sha }}
+          "@ | Out-File -Encoding UTF8 BUILD_INFO.txt
 
-      # ============================================================
-      # 15. 上传所有产物
-      # ============================================================
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
