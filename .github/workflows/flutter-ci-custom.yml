@@ -43,6 +43,7 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      # ✅ vcpkg：只 clone + bootstrap，不手动 install 包
       - name: Setup vcpkg
         shell: pwsh
         run: |
@@ -52,7 +53,8 @@ jobs:
           .\bootstrap-vcpkg.bat
           echo "VCPKG_ROOT=$PWD" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Install vcpkg dependencies (manifest mode)
+      # ✅ 关键修复：清单模式，不写任何包名
+      - name: Install vcpkg dependencies
         shell: pwsh
         run: |
           $vcpkg = "$env:VCPKG_ROOT\vcpkg.exe"
@@ -73,11 +75,11 @@ jobs:
           (Get-Content $file) -replace `
             'pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[.*\];', `
             'pub const RENDEZVOUS_SERVERS: &[&str] = &["${{ env.RENDEZVOUS_SERVER }}"];' |
-            Set-Content $file
+          Set-Content $file
           (Get-Content $file) -replace `
             'pub const RS_PUB_KEY: &str = ".*";', `
             'pub const RS_PUB_KEY: &str = "${{ env.RS_PUB_KEY }}";' |
-            Set-Content $file
+          Set-Content $file
 
       - name: Build Flutter Windows
         shell: pwsh
