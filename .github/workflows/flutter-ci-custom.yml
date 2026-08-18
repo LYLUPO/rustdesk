@@ -2,6 +2,11 @@ name: RustDesk Windows Custom Build
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (例如: 1.4.1)'
+        required: false
+        default: '1.4.1'
   push:
     tags:
       - 'v*'
@@ -15,16 +20,21 @@ env:
 
 jobs:
   build-windows:
-    name: Build Windows x64
+    name: Build Windows x64 (Flutter)
     runs-on: windows-latest
 
     steps:
+      # ============================================================
+      # 1. 检出代码（含子模块）
+      # ============================================================
       - name: Checkout rustdesk
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # Flutter
+      # ============================================================
+      # 2. 安装 Flutter
+      # ============================================================
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -34,67 +44,210 @@ jobs:
       - name: Enable Flutter desktop
         run: flutter config --enable-windows-desktop
 
-      # Rust
+      - name: Verify Flutter
+        run: flutter doctor -v
+
+      # ============================================================
+      # 3. 安装 Rust
+      # ============================================================
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Setup vcpkg
+      - name: Verify Rust
+        run: rustc --version && cargo --version
+
+      # ============================================================
+      # 4. 安装 vcpkg 并编译 C++ 依赖
+      # ============================================================
+      - name: Clone vcpkg
         shell: pwsh
         run: |
           git clone https://github.com/microsoft/vcpkg
           cd vcpkg
           git checkout ${{ env.VCPKG_COMMIT }}
-          .\bootstrap-vcpkg.bat
+          .\bootstrap-vcpkg.bat -DisableMetrics
           echo "VCPKG_ROOT=$PWD" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "VCPKG_DEFAULT_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      # 关键：写死服务器配置（hbb_common）
+      - name: Install vcpkg dependencies
+        shell: pwsh
+        run: |
+          cd vcpkg
+          .\vcpkg install --x-install-root="$PWD/installed" `
+            libvpx:x64-windows `
+            opus:x64-windows `
+            aom:x64-windows `
+            libyuv:x64-windows `
+            ffmpeg:x64-windows
+
+      # ============================================================
+      # 5. 安装 LLVM（ffigen 需要）
+      # ============================================================
+      - name: Install LLVM
+        shell: pwsh
+        run: |
+          choco install llvm -y --version=16.0.6
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ============================================================
+      # 6. 写死服务器配置到 hbb_common
+      # ============================================================
       - name: Patch hbb_common with company server
         shell: pwsh
         run: |
           $config = "libs/hbb_common/src/config.rs"
+
+          # 备份原始文件
+          Copy-Item $config "$config.bak" -Force
+
+          # 替换 RENDEZVOUS_SERVERS
           (Get-Content $config) -replace `
-            'pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[.*\];', `
+            'pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[[^\]]*\];', `
             'pub const RENDEZVOUS_SERVERS: &[&str] = &["${{ env.RENDEZVOUS_SERVER }}"];' |
-          Set-Content $config
+          Set-Content $config -Encoding UTF8
 
+          # 替换 RS_PUB_KEY
           (Get-Content $config) -replace `
-            'pub const RS_PUB_KEY: &str = ".*";', `
+            'pub const RS_PUB_KEY: &str = "[^"]*";', `
             'pub const RS_PUB_KEY: &str = "${{ env.RS_PUB_KEY }}";' |
-          Set-Content $config
+          Set-Content $config -Encoding UTF8
 
-      # 编译 Flutter Windows
-- name: Build RustDesk Windows
-  shell: pwsh
-  working-directory: flutter
-  run: |
-    flutter pub get
-    flutter build windows --release
+          # 验证替换结果
+          Write-Host "=== 验证 config.rs 关键行 ==="
+          Select-String -Path $config -Pattern "RENDEZVOUS_SERVERS|RS_PUB_KEY"
 
-- name: Prepare files for NSIS
-  shell: pwsh
-  run: |
-    New-Item -ItemType Directory -Force -Path target/release
-    Copy-Item flutter/build/windows/x64/runner/Release/* target/release/ -Recurse
+      # ============================================================
+      # 7. 编译 Flutter Windows 客户端
+      # ============================================================
+      - name: Build RustDesk Windows (Flutter)
+        shell: pwsh
+        working-directory: flutter
+        run: |
+          Write-Host "=== Flutter pub get ==="
+          flutter pub get
 
-- name: Prepare portable package
-  shell: pwsh
-  run: |
-    mkdir dist
-    Copy-Item flutter/build/windows/x64/runner/Release/* dist/ -Recurse
-    Compress-Archive dist rustdesk-portable-windows-x64.zip
+          Write-Host "=== Flutter build windows --release ==="
+          flutter build windows --release
 
-- name: Install NSIS
-  run: choco install nsis -y
+          Write-Host "=== 编译产物 ==="
+          Get-ChildItem build/windows/x64/runner/Release/ -Recurse | Select-Object FullName, Length
 
-- name: Build NSIS Installer
-  shell: pwsh
-  run: |
-    makensis res/setup.nsi
+      # ============================================================
+      # 8. 复制产物到 NSIS 期望的路径
+      # ============================================================
+      - name: Prepare files for NSIS
+        shell: pwsh
+        run: |
+          # 创建 target/release 目录（NSIS 脚本默认从这里取文件）
+          New-Item -ItemType Directory -Force -Path target/release | Out-Null
 
-- name: Rename installer
-  shell: pwsh
-  run: |
-    $ver = (Select-String -Path res/setup.nsi -Pattern '!define VERSION "(.*)"').Matches.Groups[1].Value
-    Move-Item rustdesk-setup.exe rustdesk-${ver}-company-setup.exe
+          # 复制 Flutter 编译产物
+          Copy-Item flutter/build/windows/x64/runner/Release/* target/release/ -Recurse -Force
+
+          # 复制 flutter data 资源目录（如果存在）
+          if (Test-Path "flutter/build/windows/x64/runner/Release/data") {
+            Write-Host "data/ 目录已包含在 Release 中"
+          } else {
+            Write-Host "警告: data/ 目录未找到，检查 Flutter 构建输出"
+          }
+
+          Write-Host "=== target/release 内容 ==="
+          Get-ChildItem target/release/ | Select-Object Name, Length
+
+      # ============================================================
+      # 9. 打包 Portable ZIP
+      # ============================================================
+      - name: Prepare portable package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item flutter/build/windows/x64/runner/Release/* dist/ -Recurse -Force
+
+          $zipName = "rustdesk-portable-windows-x64.zip"
+          Compress-Archive -Path dist/* -DestinationPath $zipName -Force
+          Write-Host "=== Portable ZIP 已生成: $zipName ==="
+          Get-Item $zipName | Select-Object Name, @{N='SizeMB';E={[math]::Round($_.Length/1MB,2)}}
+
+      # ============================================================
+      # 10. 安装 NSIS 并打包安装包
+      # ============================================================
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis -y
+          # 验证
+          makensis /VERSION
+
+      - name: Build NSIS Installer
+        shell: pwsh
+        run: |
+          # 提取版本号
+          $verLine = Select-String -Path "res/setup.nsi" -Pattern '!define VERSION "([^"]+)"'
+          if ($verLine) {
+            $version = $verLine.Matches.Groups[1].Value
+          } else {
+            $version = "${{ github.event.inputs.version }}"
+            if (-not $version) { $version = "1.4.1" }
+          }
+          Write-Host "版本号: $version"
+
+          # 编译 NSIS
+          makensis res/setup.nsi
+
+          # 重命名安装包
+          $installerName = "rustdesk-${version}-company-setup.exe"
+          if (Test-Path "rustdesk-setup.exe") {
+            Move-Item "rustdesk-setup.exe" $installerName -Force
+          } elseif (Test-Path "RustDesk-Setup.exe") {
+            Move-Item "RustDesk-Setup.exe" $installerName -Force
+          } else {
+            Write-Host "警告: 未找到 NSIS 输出文件，列出当前目录 .exe"
+            Get-ChildItem *.exe | Select-Object Name
+          }
+
+          Write-Host "=== 安装包已生成: $installerName ==="
+          Get-Item $installerName | Select-Object Name, @{N='SizeMB';E={[math]::Round($_.Length/1MB,2)}}
+
+      # ============================================================
+      # 11. 生成构建信息文件
+      # ============================================================
+      - name: Generate build info
+        shell: pwsh
+        run: |
+          $info = @"
+  ============================================
+   RustDesk 企业定制版 - 构建信息
+  ============================================
+   构建时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
+   构建来源: ${{ github.repository }}
+   提交哈希: ${{ github.sha }}
+   触发方式: ${{ github.event_name }}
+
+  --- 服务器配置（已写死） ---
+   ID/中继服务器: lupo.work
+   API 服务器: http://lupo.work:21114
+   Key: sR4zYVX0EaghuglbVy2knPPRWW+PoJSnydLAtdbQNVw=
+
+  --- 使用说明 ---
+   1. 安装后无需任何配置，自动连接公司服务器
+   2. 静默安装命令: .\rustdesk-*-company-setup.exe /S
+   3. 如需卸载: 控制面板 -> 卸载 或 命令行卸载
+  ============================================
+  "@
+          $info | Out-File -FilePath "BUILD_INFO.txt" -Encoding UTF8
+          Write-Host $info
+
+      # ============================================================
+      # 12. 上传所有产物
+      # ============================================================
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-windows-custom
+          path: |
+            *.exe
+            *.zip
+            BUILD_INFO.txt
+          retention-days: 90
