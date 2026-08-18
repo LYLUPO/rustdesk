@@ -1,0 +1,104 @@
+name: RustDesk Windows Custom Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  RENDEZVOUS_SERVER: lupo.work
+  RS_PUB_KEY: sR4zYVX0EaghuglbVy2knPPRWW+PoJSnydLAtdbQNVw=
+  API_SERVER: http://lupo.work:21114
+  FLUTTER_VERSION: 3.24.5
+  VCPKG_COMMIT: 2023.10.19
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout rustdesk
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Flutter
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+
+      - name: Enable Flutter desktop
+        run: flutter config --enable-windows-desktop
+
+      # Rust
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup vcpkg
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg
+          cd vcpkg
+          git checkout ${{ env.VCPKG_COMMIT }}
+          .\bootstrap-vcpkg.bat
+          echo "VCPKG_ROOT=$PWD" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # 关键：写死服务器配置（hbb_common）
+      - name: Patch hbb_common with company server
+        shell: pwsh
+        run: |
+          $config = "libs/hbb_common/src/config.rs"
+          (Get-Content $config) -replace `
+            'pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[.*\];', `
+            'pub const RENDEZVOUS_SERVERS: &[&str] = &["${{ env.RENDEZVOUS_SERVER }}"];' |
+          Set-Content $config
+
+          (Get-Content $config) -replace `
+            'pub const RS_PUB_KEY: &str = ".*";', `
+            'pub const RS_PUB_KEY: &str = "${{ env.RS_PUB_KEY }}";' |
+          Set-Content $config
+
+      # 编译 Flutter Windows
+      - name: Build RustDesk Windows
+        shell: pwsh
+        run: |
+          flutter pub get
+          flutter build windows --release
+
+      # 打包 Portable
+      - name: Prepare portable package
+        shell: pwsh
+        run: |
+          mkdir dist
+          cp build/windows/x64/runner/Release/* dist/ -Recurse
+          Compress-Archive dist rustdesk-portable-windows-x64.zip
+
+      # 打包 NSIS 安装包
+      - name: Install NSIS
+        run: choco install nsis -y
+
+      - name: Build NSIS Installer
+        shell: pwsh
+        run: |
+          makensis res/setup.nsi
+
+      - name: Rename installer
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path res/setup.nsi -Pattern '!define VERSION "(.*)"').Matches.Groups[1].Value
+          Move-Item rustdesk-setup.exe rustdesk-${ver}-company-setup.exe
+
+      # 上传产物
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-windows-custom
+          path: |
+            *.exe
+            *.zip
