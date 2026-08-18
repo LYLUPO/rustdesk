@@ -130,7 +130,27 @@ jobs:
           fi
 
       # ============================================================
-      # 7. 写死自定义服务器配置到 hbb_common
+      # 7. 锁定 flutter_rust_bridge 到 1.80.0
+      #    官方 Cargo.toml 写的是 =1.80，会被 cargo 解析成 1.80.1；
+      #    而 1.80.1 改了 IntoIntoDart trait，导致 EventToUI 不满足约束
+      #    （error[E0277]）无法编译。1.4.9 源码实际只兼容 1.80.0。
+      # ============================================================
+      - name: Pin flutter_rust_bridge to 1.80.0
+        shell: pwsh
+        run: |
+          $toml = "Cargo.toml"
+          $content = Get-Content $toml
+          $content = $content -replace `
+            'flutter_rust_bridge = \{ version = "=1\.80"', `
+            'flutter_rust_bridge = { version = "=1.80.0"'
+          $content | Set-Content $toml
+          Write-Host "=== Verify flutter_rust_bridge pin ==="
+          Select-String -Path $toml -Pattern "flutter_rust_bridge"
+          # 删除已存在的 Cargo.lock（若有），让 cargo 重新解析出 1.80.0 而非锁定 1.80.1
+          Remove-Item -Path Cargo.lock -Force -ErrorAction SilentlyContinue
+
+      # ============================================================
+      # 8. 写死自定义服务器配置到 hbb_common
       # ============================================================
       - name: Patch hbb_common with company server
         shell: pwsh
