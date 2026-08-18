@@ -65,40 +65,36 @@ jobs:
           Set-Content $config
 
       # 编译 Flutter Windows
-      - name: Build RustDesk Windows
-        shell: pwsh
-        run: |
-          flutter pub get
-          flutter build windows --release
+- name: Build RustDesk Windows
+  shell: pwsh
+  working-directory: flutter
+  run: |
+    flutter pub get
+    flutter build windows --release
 
-      # 打包 Portable
-      - name: Prepare portable package
-        shell: pwsh
-        run: |
-          mkdir dist
-          cp build/windows/x64/runner/Release/* dist/ -Recurse
-          Compress-Archive dist rustdesk-portable-windows-x64.zip
+- name: Prepare files for NSIS
+  shell: pwsh
+  run: |
+    New-Item -ItemType Directory -Force -Path target/release
+    Copy-Item flutter/build/windows/x64/runner/Release/* target/release/ -Recurse
 
-      # 打包 NSIS 安装包
-      - name: Install NSIS
-        run: choco install nsis -y
+- name: Prepare portable package
+  shell: pwsh
+  run: |
+    mkdir dist
+    Copy-Item flutter/build/windows/x64/runner/Release/* dist/ -Recurse
+    Compress-Archive dist rustdesk-portable-windows-x64.zip
 
-      - name: Build NSIS Installer
-        shell: pwsh
-        run: |
-          makensis res/setup.nsi
+- name: Install NSIS
+  run: choco install nsis -y
 
-      - name: Rename installer
-        shell: pwsh
-        run: |
-          $ver = (Select-String -Path res/setup.nsi -Pattern '!define VERSION "(.*)"').Matches.Groups[1].Value
-          Move-Item rustdesk-setup.exe rustdesk-${ver}-company-setup.exe
+- name: Build NSIS Installer
+  shell: pwsh
+  run: |
+    makensis res/setup.nsi
 
-      # 上传产物
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: rustdesk-windows-custom
-          path: |
-            *.exe
-            *.zip
+- name: Rename installer
+  shell: pwsh
+  run: |
+    $ver = (Select-String -Path res/setup.nsi -Pattern '!define VERSION "(.*)"').Matches.Groups[1].Value
+    Move-Item rustdesk-setup.exe rustdesk-${ver}-company-setup.exe
