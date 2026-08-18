@@ -1,4 +1,7 @@
-name: RustDesk Windows Custom Build
+name: RustDesk Windows Custom Build (1.4.9)
+
+# 参考官方 flutter-build.yml 的 build-for-windows-flutter (x64) 流程
+# 仅保留 x64 Windows Flutter 构建，写入自定义服务器，产出可下载安装包
 
 on:
   workflow_dispatch:
@@ -12,78 +15,127 @@ on:
       - 'v*'
 
 env:
+  # ===== 自定义服务器配置 =====
   RENDEZVOUS_SERVER: lupo.work
   RS_PUB_KEY: sR4zYVX0EaghuglbVy2knPPRWW+PoJSnydLAtdbQNVw=
   API_SERVER: http://lupo.work:21114
-  FLUTTER_VERSION: 3.24.5
-  VCPKG_COMMIT: 2023.10.19
+  # ===== 构建环境（与官方一致）=====
+  SCITER_RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VERSION: "1.4.9"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
   build-windows:
     name: Build Windows x64
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       # ============================================================
-      # 1. 拉取代码（含子模块）
+      # 1. 导出 GitHub Actions 缓存环境变量（vcpkg 二进制缓存用）
       # ============================================================
-      - name: Checkout rustdesk
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # ============================================================
+      # 2. 拉取代码（含子模块）
+      # ============================================================
+      - name: Checkout source code
         uses: actions/checkout@v5
         with:
           submodules: recursive
 
       # ============================================================
-      # 2. Flutter 环境
+      # 3. 安装 LLVM / Clang（ffigen 需要 libclang）
       # ============================================================
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
         with:
+          version: ${{ env.LLVM_VERSION }}
+
+      # ============================================================
+      # 4. Flutter 环境
+      # ============================================================
+      - name: Install flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
           flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: stable
+          architecture: x64
 
-      - name: Enable Flutter desktop
-        run: flutter config --enable-windows-desktop
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter (dropdown filter)
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]]; then
+            git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
 
       # ============================================================
-      # 3. Rust 环境
+      # 5. Rust 环境（sciter 需要 1.75，避免 i128 ABI 问题）
       # ============================================================
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
           targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022
 
       # ============================================================
-      # 4. vcpkg（仅 clone + bootstrap，不手动 install）
-      #    RustDesk 有 vcpkg.json → 清单模式 → cargo build 时自动安装依赖
+      # 6. vcpkg（lukka/run-vcpkg + 二进制缓存）
       # ============================================================
-      - name: Setup vcpkg
-        shell: pwsh
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        shell: bash
         run: |
-          git clone https://github.com/microsoft/vcpkg
-          cd vcpkg
-          git checkout ${{ env.VCPKG_COMMIT }}
-          .\bootstrap-vcpkg.bat
-          echo "VCPKG_ROOT=$PWD" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet x64-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
 
       # ============================================================
-      # 5. LLVM（ffigen 需要 libclang）
-      # ============================================================
-      - name: Install LLVM (for ffigen)
-        run: choco install llvm --version=16.0.6 -y --allow-downgrade
-
-      - name: Set LIBCLANG_PATH
-        shell: pwsh
-        run: |
-          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      # ============================================================
-      # 6. 写死服务器配置到 hbb_common
+      # 7. 写死自定义服务器配置到 hbb_common
       # ============================================================
       - name: Patch hbb_common with company server
         shell: pwsh
         run: |
           $file = "libs/hbb_common/src/config.rs"
-
           $content = Get-Content $file
           $content = $content -replace `
             'pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[.*\];', `
@@ -92,109 +144,77 @@ jobs:
             'pub const RS_PUB_KEY: &str = ".*";', `
             'pub const RS_PUB_KEY: &str = "${{ env.RS_PUB_KEY }}";'
           $content | Set-Content $file
-
           Write-Host "=== Verify patch ==="
           Select-String -Path $file -Pattern "RENDEZVOUS_SERVERS|RS_PUB_KEY"
 
       # ============================================================
-      # 7. 编译 Flutter Windows 客户端
+      # 8. 编译（官方 build.py，含 Rust 库 + Flutter + hwcodec）
       # ============================================================
-      # windows-latest runner 预装 VS 2022，而 RustDesk 写死 VS2019 生成器。
-      # Flutter 会在命令行显式传 -G "Visual Studio 16 2019"，优先级高于环境变量，
-      # 因此直接用 sed 改 CMakeLists.txt 才能生效。
-      - name: Patch CMake generator to VS 2022
-        shell: pwsh
+      - name: Build rustdesk
+        shell: bash
         run: |
-          $cmake = "flutter/windows/CMakeLists.txt"
-          $content = Get-Content $cmake
-          $content = $content -replace 'Visual Studio 16 2019', 'Visual Studio 17 2022'
-          $content | Set-Content $cmake
-          Write-Host "=== Verify generator ==="
-          Select-String -Path $cmake -Pattern "Visual Studio"
+          python3 ./build.py --portable --flutter --skip-portable-pack --hwcodec
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
 
-      - name: Build Flutter Windows
-        shell: pwsh
-        working-directory: flutter
-        run: |
-          flutter pub get
-          flutter build windows --release
+          # usbmmidd_v2
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+          mv -Force .\usbmmidd_v2 ./rustdesk
 
-      # ============================================================
-      # 8. 拷贝产物到官方 NSIS 脚本期望的路径
-      # ============================================================
-      - name: Prepare files for NSIS
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path target/release | Out-Null
-          Copy-Item flutter/build/windows/x64/runner/Release/* target/release/ -Recurse -Force
-          Write-Host "=== target/release contents ==="
-          Get-ChildItem target/release | Select-Object Name, Length
-
-      # ============================================================
-      # 9. 打包 Portable ZIP
-      # ============================================================
-      - name: Prepare portable package
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item flutter/build/windows/x64/runner/Release/* dist/ -Recurse -Force
-          Compress-Archive -Path dist/* -DestinationPath rustdesk-portable-windows-x64.zip -Force
-          Write-Host "=== Portable ZIP created ==="
-          Get-Item rustdesk-portable-windows-x64.zip | Select-Object Name, Length
-
-      # ============================================================
-      # 10. 安装 NSIS
-      # ============================================================
-      - name: Install NSIS
-        run: choco install nsis -y
-
-      # ============================================================
-      # 11. 编译 NSIS 安装包
-      # ============================================================
-      - name: Build NSIS Installer
-        shell: pwsh
-        run: |
-          makensis res/setup.nsi
-          Write-Host "=== Installer created ==="
-          Get-Item rustdesk-setup.exe | Select-Object Name, Length
-
-      # ============================================================
-      # 12. 提取版本号
-      # ============================================================
-      - name: Get version
-        id: get_version
-        shell: pwsh
-        run: |
-          $ver = "${{ github.event.inputs.version }}"
-          if (-not $ver) {
-            $match = Select-String -Path res/setup.nsi -Pattern '!define VERSION "(.*)"'
-            if ($match) { $ver = $match.Matches.Groups[1].Value }
+          # 打印机驱动（校验 sha256）
+          try {
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums -OutFile sha256sums
+            $checksum_driver = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
+            $downloadsum_driver = Get-FileHash -Path rustdesk_printer_driver_v4-1.4.zip -Algorithm SHA256
+            $checksum_adapter = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
+            $downloadsum_adapter = Get-FileHash -Path printer_driver_adapter.zip -Algorithm SHA256
+            if ($checksum_driver -eq $downloadsum_driver.Hash -and $checksum_adapter -eq $downloadsum_adapter.Hash) {
+              Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
+              mkdir ./rustdesk/drivers
+              mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+              Expand-Archive printer_driver_adapter.zip -DestinationPath .
+              mv -Force .\printer_driver_adapter.dll ./rustdesk
+            } else {
+              Write-Output "printer driver checksums do not match, ignore."
+            }
+          } catch {
+            Write-Host "Ignore the printer driver error."
           }
-          if (-not $ver) { $ver = "1.4.9" }
-          echo "VERSION=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Build version: $ver"
 
       # ============================================================
-      # 13. 重命名安装包
+      # 9. 找 Runner.res（带版本号）并打包自解压 exe
       # ============================================================
-      - name: Rename installer
-        shell: pwsh
+      # Runner.res 需要 build.py 之外的额外步骤：先用官方 res/setup.nsi 打 MSI? 这里用自解压 portable packer
+      - name: Build self-extracted executable
+        shell: bash
         run: |
-          $installer = "rustdesk-${{ steps.get_version.outputs.VERSION }}-company-setup.exe"
-          Move-Item rustdesk-setup.exe $installer -Force
-          Write-Host "Renamed to: $installer"
+          runner_res=$(find . -name "Runner.res");
+          if [ -n "$runner_res" ]; then
+            cp $runner_res ./libs/portable/Runner.res
+          fi
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          popd
+          mv ./target/release/rustdesk-portable-packer.exe ./rustdesk-${{ env.VERSION }}-x64.exe
 
       # ============================================================
-      # 14. 生成构建信息文件
+      # 10. 生成构建信息
       # ============================================================
       - name: Generate build info
         shell: pwsh
         run: |
+          $ver = "${{ github.event.inputs.version }}"
+          if (-not $ver) { $ver = "${{ env.VERSION }}" }
           $info = @"
           ========================================
           RustDesk Custom Build
           ========================================
-          Version:        ${{ steps.get_version.outputs.VERSION }}
+          Version:        $ver
           ID Server:      ${{ env.RENDEZVOUS_SERVER }}
           Relay Server:   ${{ env.RENDEZVOUS_SERVER }}
           API Server:     ${{ env.API_SERVER }}
@@ -207,14 +227,13 @@ jobs:
           Write-Host $info
 
       # ============================================================
-      # 15. 上传所有产物
+      # 11. 上传产物
       # ============================================================
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: rustdesk-windows-custom
+          name: rustdesk-windows-custom-${{ env.VERSION }}
           path: |
-            *.exe
-            *.zip
+            rustdesk-${{ env.VERSION }}-x64.exe
             BUILD_INFO.txt
           retention-days: 90
