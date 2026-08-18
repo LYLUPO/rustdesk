@@ -69,7 +69,7 @@ jobs:
       # 5. LLVM（ffigen 需要 libclang）
       # ============================================================
       - name: Install LLVM (for ffigen)
-        run: choco install llvm --version=16.0.6 -y
+        run: choco install llvm --version=16.0.6 -y --allow-downgrade
 
       - name: Set LIBCLANG_PATH
         shell: pwsh
