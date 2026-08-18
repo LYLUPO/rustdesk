@@ -17,6 +17,8 @@ env:
   API_SERVER: http://lupo.work:21114
   FLUTTER_VERSION: 3.24.5
   VCPKG_COMMIT: 2023.10.19
+  # windows-latest runner 预装的是 VS 2022，覆盖 RustDesk 写死的 VS2019 生成器
+  CMAKE_GENERATOR: Visual Studio 17 2022
 
 jobs:
   build-windows:
