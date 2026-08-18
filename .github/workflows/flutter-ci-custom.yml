@@ -17,8 +17,6 @@ env:
   API_SERVER: http://lupo.work:21114
   FLUTTER_VERSION: 3.24.5
   VCPKG_COMMIT: 2023.10.19
-  # windows-latest runner 预装的是 VS 2022，覆盖 RustDesk 写死的 VS2019 生成器
-  CMAKE_GENERATOR: Visual Studio 17 2022
 
 jobs:
   build-windows:
@@ -101,6 +99,19 @@ jobs:
       # ============================================================
       # 7. 编译 Flutter Windows 客户端
       # ============================================================
+      # windows-latest runner 预装 VS 2022，而 RustDesk 写死 VS2019 生成器。
+      # Flutter 会在命令行显式传 -G "Visual Studio 16 2019"，优先级高于环境变量，
+      # 因此直接用 sed 改 CMakeLists.txt 才能生效。
+      - name: Patch CMake generator to VS 2022
+        shell: pwsh
+        run: |
+          $cmake = "flutter/windows/CMakeLists.txt"
+          $content = Get-Content $cmake
+          $content = $content -replace 'Visual Studio 16 2019', 'Visual Studio 17 2022'
+          $content | Set-Content $cmake
+          Write-Host "=== Verify generator ==="
+          Select-String -Path $cmake -Pattern "Visual Studio"
+
       - name: Build Flutter Windows
         shell: pwsh
         working-directory: flutter
