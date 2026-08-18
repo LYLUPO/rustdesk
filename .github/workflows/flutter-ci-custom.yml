@@ -65,6 +65,12 @@ jobs:
           .\bootstrap-vcpkg.bat
           echo "VCPKG_ROOT=$PWD" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Install vcpkg dependencies
+        shell: pwsh
+        run: |
+          $vcpkg = "$env:VCPKG_ROOT\vcpkg.exe"
+          & $vcpkg install --triplet x64-windows
+
       # ============================================================
       # 5. LLVM（ffigen 需要 liclang）
       # ============================================================
