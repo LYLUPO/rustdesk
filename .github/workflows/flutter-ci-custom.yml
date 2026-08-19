@@ -130,10 +130,13 @@ jobs:
           fi
 
       # ============================================================
-      # 7. 锁定 flutter_rust_bridge 到 1.80.0
+      # 7. 锁定 flutter_rust_bridge 到 1.80.0（保留 Cargo.lock 其余条目）
       #    官方 Cargo.toml 写的是 =1.80，会被 cargo 解析成 1.80.1；
-      #    而 1.80.1 改了 IntoIntoDart trait，导致 EventToUI 不满足约束
+      #    而 .80.1 改了 IntoIntoDart trait，导致 EventToUI 不满足约束
       #    （error[E0277]）无法编译。1.4.9 源码实际只兼容 1.80.0。
+      #    注意：不可删除 Cargo.lock！仓库自带 lock 锁定了 tray-icon 等
+      #    git 依赖的旧 commit，删除会让 cargo 重新解析到 HEAD(0.24.2) 而冲突。
+      #    正确做法是用 `cargo update --precise` 只降 frb，其余条目原样保留。
       # ============================================================
       - name: Pin flutter_rust_bridge to 1.80.0
         shell: pwsh
@@ -146,8 +149,16 @@ jobs:
           $content | Set-Content $toml
           Write-Host "=== Verify flutter_rust_bridge pin ==="
           Select-String -Path $toml -Pattern "flutter_rust_bridge"
-          # 删除已存在的 Cargo.lock（若有），让 cargo 重新解析出 1.80.0 而非锁定 1.80.1
-          Remove-Item -Path Cargo.lock -Force -ErrorAction SilentlyContinue
+
+      - name: Downgrade flutter_rust_bridge in Cargo.lock (keep other locks)
+        shell: bash
+        run: |
+          cargo update -p flutter_rust_bridge --precise 1.80.0
+          # 连带降 codegen / macro 等同系列包（若存在）
+          cargo update -p flutter_rust_bridge_codegen --precise 1.80.0 || true
+          cargo update -p flutter_rust_bridge_macros --precise 1.80.0 || true
+          echo "=== lock entry ==="
+          grep -A2 'name = "flutter_rust_bridge"' Cargo.lock || true
 
       # ============================================================
       # 8. 写死自定义服务器配置到 hbb_common
